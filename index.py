@@ -1,124 +1,172 @@
 from dotenv import load_dotenv
+
 _ = load_dotenv()
 
 from langgraph.graph import StateGraph, END
-
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated, List
 import operator
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ChatMessage
+from langchain_openai import ChatOpenAI
 
-class AgentState(TypedDict):
-    lnode: str
-    scratch: str
-    count: Annotated[int, operator.add]
-
-def node1(state: AgentState):
-    print(f"node1, count:{state['count']}")
-    return {
-        "lnode":"node_1",
-        "count": 1,
-    }
-    
-def node2(state: AgentState):
-    print(f"node2, count:{state['count']}")
-    return {
-        "lnode": "node_2",
-        "count": 1,
-    }
-
-def should_continue(state):
-    return state['count'] < 3
-
-
-builder = StateGraph(AgentState) 
-builder.add_node("Node1", node1)
-builder.add_node("Node2", node2)
-
-builder.add_edge("Node1", "Node2")
-builder.add_conditional_edges("Node2", should_continue, {True: "Node1", False: END})
-
-builder.set_entry_point("Node1")
+model = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 
 memory = SqliteSaver.from_conn_string(":memory:")
 
+class AgentState(TypedDict):
+    task: str
+    plan: str
+    draft: str
+    critique: str
+    content: List[str]
+    revision_number: int
+    max_revisions: int
+    
+PLAN_PROMPT = """You are an expert writer tasked with writing a high level outline of an essay. \
+Write such an outline for the user provided topic. Give an outline of the essay along with any relevant notes \
+or instructions for the sections."""
+
+WRITER_PROMPT = """You are an essay assistant tasked with writing excellent 5-paragraph essays.\
+Generate the best essay possible for the user's request and the initial outline. \
+If the user provides critique, respond with a revised version of your previous attempts. \
+Utilize all the information below as needed: 
+
+------
+
+{content}"""
+
+REFLECTION_PROMPT = """You are a teacher grading an essay submission. \
+Generate critique and recommendations for the user's submission. \
+Provide detailed recommendations, including requests for length, depth, style, etc."""
+
+
+RESEARCH_PLAN_PROMPT = """You are a researcher charged with providing information that can \
+be used when writing the following essay. Generate a list of search queries that will gather \
+any relevant information. Only generate 3 queries max."""
+
+
+RESEARCH_CRITIQUE_PROMPT = """You are a researcher charged with providing information that can \
+be used when making any requested revisions (as outlined below). \
+Generate a list of search queries that will gather any relevant information. Only generate 3 queries max."""
+
+from langchain_core.pydantic_v1 import BaseModel
+class Queries(BaseModel):
+    queries: List[str]
+
+from tavily import TavilyClient
+import os
+tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+def plan_node(state: AgentState):
+    messages = [
+        SystemMessage(content=PLAN_PROMPT),
+        HumanMessage(content=state['task'])
+    ]
+    response = model.invoke(messages)
+    return {
+        "plan" : response.content
+    }
+
+def research_plan_node(state: AgentState):
+    queries = model.with_structured_output(Queries).invoke([
+        SystemMessage(content=RESEARCH_PLAN_PROMPT), 
+        HumanMessage(content=state['task'])
+    ])
+    
+    
+    content = state['content'] or []
+    for q in queries.queries:
+        response = tavily.search(query=q, max_results=2)
+        for r in response['results']:
+            content.append(r['content'])
+    return {"content": content}
+
+def generation_node(state: AgentState):
+    content = "\n\n".join(state['content'] or [])
+    user_message = HumanMessage(
+        content=f"{state['task']}\n\nHere is my plan:\n\n{state['plan']}")
+    messages = [
+        SystemMessage(
+            content=WRITER_PROMPT.format(content=content)
+        ), 
+        user_message
+    ]
+    response = model.invoke(messages)
+    return {
+        "draft": response.content,
+        "revision_number": state.get("revision_number", 1) + 1
+    }
+
+def reflection_node(state: AgentState):
+    messages = [
+        SystemMessage(content=REFLECTION_PROMPT),
+        HumanMessage(content=state['draft'])
+    ]
+    response = model.invoke(messages)
+    return {"critique": response.content}
+
+def research_critique_node(state: AgentState):
+    queries = model.with_structured_output(Queries).invoke([
+        SystemMessage(content=RESEARCH_CRITIQUE_PROMPT),
+        HumanMessage(content=state['critique'])
+    ])
+    content = state['content'] or []
+    for q in queries.queries:
+        response = tavily.search(query=q, max_results=2)
+        for r in response['results']:
+            content.append(r['content'])
+    return {"content": content}
+
+def should_continue(state):
+    if state["revision_number"] > state["max_revisions"]:
+        return END
+    return "reflect"
+
+builder = StateGraph(AgentState)
+
+builder.add_node("planner", plan_node)
+builder.add_node("generate", generation_node)
+builder.add_node("reflect", reflection_node)
+builder.add_node("research_plan", research_plan_node)
+builder.add_node("research_critique", research_critique_node)
+
+builder.set_entry_point("planner")
+
+builder.add_conditional_edges(
+    "generate",
+    should_continue,
+    {END: END, "reflect": "reflect"}
+)
+
+builder.add_edge("planner", "research_plan")
+builder.add_edge("research_plan", "generate")
+
+builder.add_edge("reflect", "research_critique")
+builder.add_edge("research_critique", "generate")
+
 graph = builder.compile(checkpointer=memory)
-
-# Run it
-
-thread = {"configurable": {"thread_id": str(1)}}
-graph.invoke({"count": 0, "scratch": "hi"}, thread)
-
-# Look at current state
-graph.get_state(thread)
-
-# Look at state history
-
-for state in graph.get_state_history(thread):
-    print(state, "\n")
-
-states = []
-for state in graph.get_state_history(thread):
-    states.append(state.config)
-    print(state.config, state.values['count'])
-
-# Grab an early state
-
-print(states[-3])
-
-graph.get_state(states[-3])
-
-# Go back in time
-
-graph.invoke(None, states[-3])
-
-thread = {"configurable": {"thread_id": str(1)}} 
-for state in graph.get_state_history(thread):
-    print(state.config, state.values['count'])
-
-thread = {"configurable": {"thread_id" : str(1)}}
-for state in graph.get_state_history(thread):
-    print(state, "\n")
-
-# Modify state
-thread2 = {"configurable": {"thread_id": str(2)}}
-graph.invoke({"count": 0, "scratch": "hi"}, thread2)
 
 from IPython.display import Image
 
 Image(graph.get_graph().draw_png())
 
-states2 = []
-for state in graph.get_state_history(thread2):
-    states2.append(state.config)
-    print(state.config, state.values['count'])
 
-#Start by grabbing a state
-save_state = graph.get_state(states2[-3])
-print(save_state)
-
-save_state.values['count'] = -3
-save_state.values['scratch'] = "hello"
-print(save_state)
-
-graph.update_state(thread2, save_state.values)
-
-for i, state in enumerate(graph.get_state_history(thread2)):
-    if i >= 3: # print latest 3
-        break
-    print(state, '\n')
-
-graph.update_state(thread2, save_state.values, as_node="Node1")
-
-for i, state in enumerate(graph.get_state_history(thread2)):
-    if i >= 3:
-        break
-    print(state, '\n')
-
-graph.invoke(None, thread2)
-
-for state in graph.get_state_history(thread2):
-    print(state, '\n')
-
-
-
+thread = {"configurable": {"thread_id": "1"}}
+for s in graph.stream({
+    'task': "what is the difference between langchain and langsmith", 
+    "max_revisions": 2,
+    "revision_number": 1,
     
+}, thread):
+    print(s)
+    
+
+# Essay writer interface
+# import warnings
+# warnings.filterwarnings("ignore")
+
+# from helper import ewriter, writer_gui
+
+# MultiAgent = ewriter()
+# app = writer_gui(MultiAgent.graph)
+# app.launch()
