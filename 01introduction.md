@@ -6,6 +6,8 @@
 
 - You can try executing each python script one-by-one and playaround
 
+- Remember to populate the `.env` file with necessary environments variables. You can refer the `.env-example.txt` file 
+
 ### Important links
 
 - [DeepLearningAI Courses](https://learn.deeplearning.ai/)
